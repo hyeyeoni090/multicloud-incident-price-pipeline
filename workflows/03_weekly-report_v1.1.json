@@ -1,0 +1,184 @@
+{
+  "name": "③ 멀티클라우드 주간 리포트",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "c3000000-0000-4000-8000-000000000001",
+      "name": "매주 월요일 9시",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "여기에_구글시트_URL_붙여넣기"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "incidents"
+        },
+        "options": {}
+      },
+      "id": "c3000000-0000-4000-8000-000000000002",
+      "name": "장애 기록 읽기",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        300
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "여기에_구글시트_URL_붙여넣기"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "prices"
+        },
+        "options": {}
+      },
+      "id": "c3000000-0000-4000-8000-000000000003",
+      "name": "요금 기록 읽기",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        480,
+        300
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// 지난 7일 장애 + 최신 요금 → 주간 리포트 (HTML)\nconst now = $now.setZone('Asia/Seoul');\nconst end = now.toMillis();\nconst start = end - 7 * 864e5;\nconst esc = s => String(s ?? '').replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));\nconst num = v => (v === '' || v == null) ? null : Number(v);\nconst isTrue = v => v === true || String(v).toUpperCase() === 'TRUE';\nconst fmtMin = m => m >= 60 ? `${Math.floor(m / 60)}시간 ${Math.round(m % 60)}분` : `${Math.round(m)}분`;\nconst kst = iso => iso ? $now.constructor.fromISO(iso).setZone('Asia/Seoul').toFormat('MM/dd HH:mm') : '';\n\n// ---------- 장애 ----------\nconst incidents = $('장애 기록 읽기').all().map(i => i.json).filter(r => r.incident_key);\nconst PROVIDERS = ['GCP', 'AWS', 'Azure'];\nconst SEOUL = /seoul|korea|asia-northeast3|ap-northeast-2|koreacentral/i;\nconst inWin = [];\nfor (const r of incidents) {\n  const s = Date.parse(r.started_at);\n  if (isNaN(s)) continue;\n  const e = r.ended_at ? Date.parse(r.ended_at) : end;\n  if (s >= end || e <= start) continue;\n  const mins = (Math.min(e, end) - Math.max(s, start)) / 60000;\n  inWin.push({ ...r, mins, ongoing: !r.ended_at || r.status === 'ongoing' });\n}\nconst byProv = PROVIDERS.map(p => {\n  const rows = inWin.filter(r => r.provider === p);\n  return { p, count: rows.length, mins: rows.reduce((a, r) => a + r.mins, 0),\n           ongoing: rows.filter(r => r.ongoing).length, seoul: rows.filter(r => SEOUL.test(`${r.regions} ${r.title}`)).length };\n});\nconst top = [...inWin].sort((a, b) => b.mins - a.mins).slice(0, 5);\nconst seoulRows = inWin.filter(r => SEOUL.test(`${r.regions} ${r.title}`));\n\n// ---------- 요금 ----------\nconst prices = $input.all().map(i => i.json).filter(r => r.price_key);\n// 제공사별로 각자 가장 최근 날짜를 사용 (한 제공사 수집이 실패한 날에도 표가 비지 않도록)\nconst latestBy = {};\nfor (const r of prices) {\n  const d = String(r.date);\n  if (!latestBy[r.provider] || d > latestBy[r.provider]) latestBy[r.provider] = d;\n}\nconst latestDate = Object.values(latestBy).sort().pop() || '';\nconst latest = prices.filter(r => String(r.date) === latestBy[r.provider])\n  .map(r => ({ ...r, hourly: num(r.hourly_usd), monthly: num(r.monthly_usd) }))\n  .sort((a, b) => a.pricing.localeCompare(b.pricing) || a.hourly - b.hourly);\nconst startDate = $now.constructor.fromMillis(start).setZone('Asia/Seoul').toFormat('yyyy-MM-dd');\nconst changes = prices.filter(r => String(r.date) >= startDate && isTrue(r.changed));\nconst od = latest.filter(r => r.pricing === 'OnDemand');\nconst sp = latest.filter(r => r.pricing === 'Spot');\nconst cheapOD = od[0], dearOD = od[od.length - 1], cheapSpot = sp[0];\n\n// ---------- 핵심 인사이트 ----------\nconst insights = [];\nconst worst = [...byProv].sort((a, b) => b.mins - a.mins)[0];\nif (worst && worst.mins > 0) insights.push(`지난 7일 장애 지속시간이 가장 긴 곳은 <b>${worst.p}</b>(${worst.count}건, 누적 ${fmtMin(worst.mins)})입니다.`);\nelse insights.push('지난 7일 동안 수집된 장애가 없습니다.');\ninsights.push(seoulRows.length ? `서울 리전 관련 장애가 <b>${seoulRows.length}건</b> 있었습니다.` : '서울 리전 관련 장애는 없었습니다.');\nif (cheapOD && dearOD && cheapOD !== dearOD) {\n  const gap = ((dearOD.hourly - cheapOD.hourly) / dearOD.hourly * 100).toFixed(1);\n  insights.push(`온디맨드 최저가는 <b>${esc(cheapOD.provider)} ${esc(cheapOD.instance)}</b>($${cheapOD.hourly}/h, 월 $${cheapOD.monthly})로, 최고가 대비 <b>${gap}%</b> 저렴합니다.`);\n}\nif (cheapSpot && cheapOD) {\n  const save = ((1 - cheapSpot.hourly / cheapOD.hourly) * 100).toFixed(0);\n  insights.push(`스팟 최저가(<b>${esc(cheapSpot.provider)} ${esc(cheapSpot.instance)}</b>, $${cheapSpot.hourly}/h)는 온디맨드 최저가보다 약 <b>${save}%</b> 저렴합니다. 중단 허용 워크로드에 검토할 만합니다.`);\n}\ninsights.push(changes.length ? `이번 주 요금 변동이 <b>${changes.length}건</b> 감지되었습니다.` : '이번 주 요금 변동은 없었습니다.');\n\n// ---------- HTML ----------\nconst th = 'style=\"text-align:left;padding:6px 10px;border-bottom:2px solid #ddd;background:#f6f7f9;font-size:13px\"';\nconst td = 'style=\"padding:6px 10px;border-bottom:1px solid #eee;font-size:13px\"';\nconst table = (heads, rows) => `<table style=\"border-collapse:collapse;width:100%;margin:8px 0 20px\">\n<tr>${heads.map(h => `<th ${th}>${h}</th>`).join('')}</tr>\n${rows.length ? rows.map(r => `<tr>${r.map(c => `<td ${td}>${c}</td>`).join('')}</tr>`).join('') : `<tr><td ${td} colspan=\"${heads.length}\">데이터 없음</td></tr>`}\n</table>`;\nconst period = `${startDate} ~ ${now.toFormat('yyyy-MM-dd')}`;\n\nconst html = `<div style=\"font-family:Apple SD Gothic Neo,Malgun Gothic,Arial,sans-serif;max-width:720px;color:#222\">\n<h2 style=\"margin:0 0 4px\">멀티클라우드 주간 리포트</h2>\n<div style=\"color:#666;font-size:13px;margin-bottom:16px\">${period} · GCP / AWS / Azure · 자동 생성(n8n)</div>\n\n<h3 style=\"margin:16px 0 6px\">핵심 요약</h3>\n<ul style=\"margin:0 0 16px;padding-left:20px;font-size:14px;line-height:1.7\">${insights.map(s => `<li>${s}</li>`).join('')}</ul>\n\n<h3 style=\"margin:16px 0 6px\">1. 제공사별 장애 현황 (지난 7일)</h3>\n${table(['제공사', '장애 건수', '누적 지속시간', '진행 중', '서울 관련'],\n  byProv.map(b => [b.p, b.count, fmtMin(b.mins), b.ongoing, b.seoul]))}\n\n<h3 style=\"margin:16px 0 6px\">2. 지속시간 상위 장애</h3>\n${table(['제공사', '서비스', '리전', '시작(KST)', '지속'],\n  top.map(r => [esc(r.provider), esc(r.service), esc(String(r.regions).slice(0, 40)), kst(r.started_at), fmtMin(r.mins) + (r.ongoing ? ' (진행 중)' : '')]))}\n\n<h3 style=\"margin:16px 0 6px\">3. 서울 리전 VM 요금 비교 (4 vCPU / 16GB, ${esc(latestDate)} 기준)</h3>\n${table(['과금', '제공사', '인스턴스', '시간당', '월 환산(730h)', ''],\n  latest.map(r => [r.pricing, esc(r.provider), esc(r.instance), '$' + r.hourly, '$' + r.monthly, isTrue(r.cheapest) ? '✅ 최저가' : '']))}\n\n<h3 style=\"margin:16px 0 6px\">4. 이번 주 요금 변동</h3>\n${table(['날짜', '제공사', '인스턴스', '과금', '이전 → 현재', '변동률'],\n  changes.map(r => [esc(r.date), esc(r.provider), esc(r.instance), esc(r.pricing), `$${r.prev_hourly_usd} → $${r.hourly_usd}`, `${r.change_pct}%`]))}\n\n<div style=\"color:#999;font-size:12px;margin-top:24px;line-height:1.6\">\n※ 장애 지속시간은 각 사 공개 상태 페이지에 게시된 시작~종료 시각 기준이며, 실제 서비스 영향 시간과 다를 수 있습니다.<br>\n※ 요금은 각 사 공개 가격 API(Azure Retail Prices, GCP Cloud Billing Catalog)의 Linux 정가 기준이며 할인·약정은 반영하지 않았습니다.\n</div></div>`;\n\nconst summary = `📊 주간 리포트 (${period})\\n` +\n  byProv.map(b => `${b.p}: 장애 ${b.count}건 / ${fmtMin(b.mins)}`).join('\\n') +\n  (cheapOD ? `\\n💰 온디맨드 최저가: ${cheapOD.provider} ${cheapOD.instance} $${cheapOD.hourly}/h` : '') +\n  `\\n📧 상세 내용은 메일을 확인하세요.`;\n\nreturn [{ json: { subject: `[주간] 멀티클라우드 장애·요금 리포트 (${period})`, html, summary } }];"
+      },
+      "id": "c3000000-0000-4000-8000-000000000004",
+      "name": "리포트 생성",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "hyeyeoni090@gmail.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "c3000000-0000-4000-8000-000000000005",
+      "name": "Gmail 발송",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        960,
+        200
+      ],
+      "webhookId": "c3000000-0000-4000-8000-0000000000ff"
+    },
+    {
+      "parameters": {
+        "chatId": "여기에_텔레그램_chat_id",
+        "text": "={{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "c3000000-0000-4000-8000-000000000006",
+      "name": "텔레그램 요약",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "매주 월요일 9시": {
+      "main": [
+        [
+          {
+            "node": "장애 기록 읽기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "장애 기록 읽기": {
+      "main": [
+        [
+          {
+            "node": "요금 기록 읽기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "요금 기록 읽기": {
+      "main": [
+        [
+          {
+            "node": "리포트 생성",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "리포트 생성": {
+      "main": [
+        [
+          {
+            "node": "Gmail 발송",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "텔레그램 요약",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Seoul"
+  },
+  "pinData": {}
+}
