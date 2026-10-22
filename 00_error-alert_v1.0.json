@@ -1,0 +1,67 @@
+{
+  "name": "⚠️ 에러 알림",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "a2b7cf01-8e26-4320-8299-0eae1a1a133d",
+      "name": "Error Trigger"
+    },
+    {
+      "parameters": {
+        "chatId": "8892721968",
+        "text": "=     ⚠️ 워크플로우 실패\n     이름: {{ $json.workflow.name }}\n     노드: {{ $json.execution.lastNodeExecuted }}\n     에러: {{ $json.execution.error.message }}\n     시각: {{ $now.setZone('Asia/Seoul').toFormat('yyyy-MM-dd HH:mm') }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        224,
+        0
+      ],
+      "id": "be56a836-73e1-4ff0-ac21-389d1604f287",
+      "name": "Send a text message",
+      "webhookId": "bb8f706c-4fb7-497d-afc0-7039c3e48a92",
+      "credentials": {
+        "telegramApi": {
+          "id": "CWcoAfDMB9krqyUU",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "f838df59-e8c0-4c76-8338-b739fc4cd740",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "34462e24046148020c6f8e4e8e9b1d03aa7907210ded0dfc77e75c690cc27ee1"
+  },
+  "nodeGroups": [],
+  "id": "bXk8kyYMo7jHgZTf",
+  "tags": []
+}

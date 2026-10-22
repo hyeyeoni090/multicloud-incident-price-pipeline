@@ -1,0 +1,584 @@
+{
+  "name": "① 멀티클라우드 장애 수집기",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "id": "be0e6578-fcc8-4434-92c2-e0279d5cf806",
+      "name": "매시간 실행",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -240,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://status.cloud.google.com/incidents.json",
+        "options": {}
+      },
+      "id": "40a820bf-88b3-4bc4-baa8-9bf9311d81ec",
+      "name": "GCP 장애 조회",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://health.aws.amazon.com/public/currentevents",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "a20cdc7c-2f5a-4d33-bbd4-64502443daa8",
+      "name": "AWS 장애 조회",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        208
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://azure.status.microsoft/en-us/status/feed/",
+        "options": {}
+      },
+      "id": "ce1db60c-903e-4e67-8d4c-5c5e840ed9dd",
+      "name": "Azure 장애 조회",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [
+        0,
+        400
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// GCP incidents.json → 공통 스키마 (최근 90일)\nconst DAYS = 90;\nconst cutoff = Date.now() - DAYS * 864e5;\nconst raw = $input.all().flatMap(it => Array.isArray(it.json) ? it.json : [it.json]);\nif (!raw.length || raw[0].error) return []; // 조회 실패 → meta 없음 → 종료 처리 안 함\n\nconst out = [{ json: { _meta: 'GCP' } }];\nfor (const i of raw) {\n  if (!i || !i.id || !i.begin) continue;\n  if (new Date(i.begin).getTime() < cutoff) continue;\n  const locs = [...(i.currently_affected_locations || []), ...(i.previously_affected_locations || [])].map(l => l.id);\n  const products = (i.affected_products || []).map(p => p.title);\n  out.push({ json: {\n    incident_key: `GCP:${i.id}`,\n    provider: 'GCP',\n    service: i.service_name === 'Multiple Products' ? `Multiple (${products.length})` : i.service_name,\n    regions: [...new Set(locs)].join(', ') || 'global',\n    severity: i.severity || '',\n    status: i.end ? 'resolved' : 'ongoing',\n    title: (i.external_desc || '').slice(0, 200),\n    started_at: new Date(i.begin).toISOString(),\n    ended_at: i.end ? new Date(i.end).toISOString() : '',\n    url: `https://status.cloud.google.com/${i.uri}`\n  }});\n}\nreturn out;"
+      },
+      "id": "62b6c098-1761-4c81-a950-2c398f3e5419",
+      "name": "GCP 정규화",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// AWS currentevents (UTF-16 인코딩!) → 공통 스키마\nconst item = $input.first();\nif (!item || !item.binary || !item.binary.data) return []; // 조회 실패\n\nconst buf = await this.helpers.getBinaryDataBuffer(0, 'data');\nlet text;\nif (buf[0] === 0xFF && buf[1] === 0xFE) text = buf.subarray(2).toString('utf16le');\nelse if (buf[0] === 0xFE && buf[1] === 0xFF) { const b = Buffer.from(buf.subarray(2)); b.swap16(); text = b.toString('utf16le'); }\nelse if (buf.length > 1 && buf[1] === 0x00) text = buf.toString('utf16le');\nelse text = buf.toString('utf8');\ntext = text.replace(/^\\uFEFF/, '').trim();\nconst events = text ? JSON.parse(text) : [];\n\nconst SEV = { '1': 'informational', '2': 'degradation', '3': 'disruption' };\nconst out = [{ json: { _meta: 'AWS' } }];\nfor (const e of events) {\n  const log = e.event_log || [];\n  const last = log[log.length - 1] || {};\n  const regionCode = (e.arn || '').split(':')[3] || '';\n  out.push({ json: {\n    incident_key: `AWS:${e.arn}`,\n    provider: 'AWS',\n    service: e.service_name || e.service,\n    regions: [e.region_name, regionCode].filter(Boolean).join(' / ') || 'global',\n    severity: SEV[String(e.status)] || String(e.status || ''),\n    status: 'ongoing',\n    title: `${e.summary || ''} — ${last.summary || ''}`.slice(0, 200),\n    started_at: new Date(Number(e.date) * 1000).toISOString(),\n    ended_at: '',\n    url: 'https://health.aws.amazon.com/health/status'\n  }});\n}\nreturn out;"
+      },
+      "id": "e920a564-5845-40ca-bab6-11b7aa16344f",
+      "name": "AWS 정규화",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Azure 상태 RSS → 공통 스키마 (장애 없으면 피드가 비어 있음)\nconst items = $input.all().map(i => i.json);\nif (items.some(i => i.error)) return []; // 조회 실패\n\nconst out = [{ json: { _meta: 'Azure' } }];\nfor (const i of items) {\n  if (!i || !i.title) continue;\n  const text = `${i.title} ${i.contentSnippet || i.content || ''}`;\n  const m = text.match(/\\b(Korea Central|Korea South|East US 2?|West US 2?|West Europe|North Europe|Southeast Asia|East Asia|Japan East)\\b/);\n  out.push({ json: {\n    incident_key: `Azure:${i.guid || i.link || i.title}`,\n    provider: 'Azure',\n    service: (i.title.split(' - ')[0] || i.title).slice(0, 80),\n    regions: m ? m[1] : 'see title',\n    severity: 'n/a',\n    status: 'ongoing',\n    title: i.title.slice(0, 200),\n    started_at: i.pubDate ? new Date(i.pubDate).toISOString() : new Date().toISOString(),\n    ended_at: '',\n    url: i.link || 'https://azure.status.microsoft/en-us/status/'\n  }});\n}\nreturn out;"
+      },
+      "id": "3e5bd01b-9df9-4ee9-a6ca-8d70dcedcd83",
+      "name": "Azure 정규화",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "id": "71c25c3e-dd72-4e5c-a0d0-a9b60bc2d965",
+      "name": "3사 합치기",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        480,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit?gid=0#gid=0",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "incidents",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit#gid=0"
+        },
+        "options": {}
+      },
+      "id": "916efda6-a53c-4751-a772-f1984927ba07",
+      "name": "기존 기록 읽기",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        704,
+        208
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "XwfiWbkFSDPRbakW",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// 신규 / 변경 / 종료 판정 + 알림 대상 표시\nconst now = new Date().toISOString();\nconst merged = $('3사 합치기').all().map(i => i.json);\nconst okProviders = new Set(merged.filter(r => r._meta).map(r => r._meta)); // 조회 성공한 제공사\nconst current = merged.filter(r => r.incident_key);\nconst existing = $input.all().map(i => i.json).filter(r => r.incident_key);\n\nconst exMap = new Map(existing.map(r => [r.incident_key, r]));\nconst curKeys = new Set(current.map(r => r.incident_key));\nconst firstRun = existing.length === 0; // 첫 실행엔 알림 폭탄 방지\nconst WATCH = /seoul|korea|asia-northeast3|ap-northeast-2|koreacentral/i;\nconst dur = (s, e) => (s && e) ? Math.round((new Date(e) - new Date(s)) / 60000) : '';\n\nconst out = [];\nfor (const r of current) {\n  const old = exMap.get(r.incident_key);\n  const row = { ...r, first_seen: (old && old.first_seen) || now, last_seen: now };\n  row.duration_min = dur(row.started_at, row.ended_at);\n  let action = 'unchanged';\n  if (!old) action = 'new';\n  else if (old.status !== row.status || String(old.ended_at || '') !== String(row.ended_at || '')) action = 'updated';\n  const important = ['high', 'disruption'].includes(String(row.severity).toLowerCase()) || WATCH.test(`${row.regions} ${row.title}`);\n  out.push({ json: { ...row, action, alert: action === 'new' && !firstRun && important } });\n}\n\n// AWS·Azure는 '현재 장애'만 공개 → 피드에서 사라지면 종료로 기록 (조회 성공한 경우에만)\nfor (const old of existing) {\n  if (curKeys.has(old.incident_key)) continue;\n  if (old.provider === 'GCP' || old.status === 'resolved') continue;\n  if (!okProviders.has(old.provider)) continue;\n  out.push({ json: { ...old, status: 'resolved', ended_at: now, duration_min: dur(old.started_at, now), last_seen: now, action: 'resolved', alert: false } });\n}\nreturn out;"
+      },
+      "id": "b058c30a-f6f0-471a-999c-b22bf21592d5",
+      "name": "신규·종료 판정",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit?gid=0#gid=0",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "incidents",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "incident_key"
+          ],
+          "schema": [
+            {
+              "id": "incident_key",
+              "displayName": "incident_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "provider",
+              "displayName": "provider",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "service",
+              "displayName": "service",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "regions",
+              "displayName": "regions",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "started_at",
+              "displayName": "started_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ended_at",
+              "displayName": "ended_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "duration_min",
+              "displayName": "duration_min",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "first_seen",
+              "displayName": "first_seen",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_seen",
+              "displayName": "last_seen",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "url",
+              "displayName": "url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "action",
+              "displayName": "action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "alert",
+              "displayName": "alert",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "30462d58-a13f-4765-a0ce-dbb5a3aa878e",
+      "name": "시트에 저장(업서트)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1168,
+        112
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "XwfiWbkFSDPRbakW",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "b1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.alert }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4f7db2c5-e04d-45ae-ba41-5cc6a7632bb2",
+      "name": "알림 대상만",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "8892721968",
+        "text": "=🚨 [{{ $json.provider }}] {{ $json.service }}\n지역: {{ $json.regions }}\n심각도: {{ $json.severity }}\n시작: {{ $json.started_at }}\n\n{{ $json.title }}\n{{ $json.url }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "8ae60b68-a21c-445c-8e82-1d0664ed9b41",
+      "name": "텔레그램 알림",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1392,
+        320
+      ],
+      "webhookId": "a1ac6ca3-a10e-44b4-b9ad-fe2c7b3dd9c9",
+      "credentials": {
+        "telegramApi": {
+          "id": "CWcoAfDMB9krqyUU",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "매시간 실행": {
+      "main": [
+        [
+          {
+            "node": "GCP 장애 조회",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AWS 장애 조회",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Azure 장애 조회",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCP 장애 조회": {
+      "main": [
+        [
+          {
+            "node": "GCP 정규화",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AWS 장애 조회": {
+      "main": [
+        [
+          {
+            "node": "AWS 정규화",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Azure 장애 조회": {
+      "main": [
+        [
+          {
+            "node": "Azure 정규화",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCP 정규화": {
+      "main": [
+        [
+          {
+            "node": "3사 합치기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AWS 정규화": {
+      "main": [
+        [
+          {
+            "node": "3사 합치기",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Azure 정규화": {
+      "main": [
+        [
+          {
+            "node": "3사 합치기",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "3사 합치기": {
+      "main": [
+        [
+          {
+            "node": "기존 기록 읽기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "기존 기록 읽기": {
+      "main": [
+        [
+          {
+            "node": "신규·종료 판정",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "신규·종료 판정": {
+      "main": [
+        [
+          {
+            "node": "시트에 저장(업서트)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "알림 대상만",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "알림 대상만": {
+      "main": [
+        [
+          {
+            "node": "텔레그램 알림",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "timezone": "Asia/Seoul",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false,
+    "timeSavedPerExecution": 15,
+    "errorWorkflow": "bXk8kyYMo7jHgZTf"
+  },
+  "versionId": "04e5aee6-738a-409d-b4ba-48855a66ad24",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "34462e24046148020c6f8e4e8e9b1d03aa7907210ded0dfc77e75c690cc27ee1"
+  },
+  "nodeGroups": [],
+  "id": "qZd0lCuMWbrwUMnB",
+  "tags": []
+}

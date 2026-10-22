@@ -1,0 +1,576 @@
+{
+  "name": "② 서울 리전 VM 요금 트래커",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "2366a7db-c30d-4241-941d-02d5006bbff6",
+      "name": "매일 오전 9시",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -240,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://prices.azure.com/api/retail/prices",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "currencyCode",
+              "value": "'USD'"
+            },
+            {
+              "name": "$filter",
+              "value": "armRegionName eq 'koreacentral' and priceType eq 'Consumption' and (armSkuName eq 'Standard_D4s_v5' or armSkuName eq 'Standard_D4as_v5')"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "37ecba0e-c7fc-4f22-979d-9301f2cc8cb2",
+      "name": "Azure 요금 조회",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "currencyCode",
+              "value": "USD"
+            },
+            {
+              "name": "pageSize",
+              "value": "5000"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "name": "pageToken",
+                    "value": "={{ $response.body.nextPageToken }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.nextPageToken }}",
+              "limitPagesFetched": true,
+              "maxRequests": 30
+            }
+          }
+        }
+      },
+      "id": "1622440e-5cbf-469c-ac87-ae45ee5b5960",
+      "name": "GCP 요금 조회",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        240
+      ],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "9t9YoSndAdJ5SaFT",
+          "name": "GCP Billing API Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Azure Retail Prices → 공통 스키마 (Linux, 서울 리전)\nconst SPECS = {\n  'Standard_D4s_v5':  { family: 'Dsv5 (Intel)', vcpu: 4, mem: 16 },\n  'Standard_D4as_v5': { family: 'Dasv5 (AMD)',  vcpu: 4, mem: 16 },\n};\nconst items = $input.all().flatMap(i => i.json.Items || []);\nif (!items.length) return []; // 조회 실패 시 빈 결과\n\nconst today = $now.setZone('Asia/Seoul').toFormat('yyyy-MM-dd');\nconst out = [];\nconst seen = new Set();\nfor (const it of items) {\n  if (!/^Virtual Machines /i.test(it.productName || '')) continue; // VM만 (Cloud Services 제외)\n  if (/windows/i.test(it.productName || '')) continue;   // Linux만\n  if (/low priority/i.test(it.skuName || '')) continue;  // 구형 Low Priority 제외\n  const spec = SPECS[it.armSkuName];\n  if (!spec) continue;\n  const pricing = /spot/i.test(it.skuName || '') ? 'Spot' : 'OnDemand';\n  const k = `${it.armSkuName}|${pricing}`;\n  if (seen.has(k)) continue; // 중복 방지\n  seen.add(k);\n  const hourly = Number(it.retailPrice);\n  out.push({ json: {\n    date: today,\n    provider: 'Azure',\n    instance: it.armSkuName,\n    family: spec.family,\n    vcpu: spec.vcpu,\n    memory_gb: spec.mem,\n    region: 'koreacentral (Seoul)',\n    pricing,\n    hourly_usd: +hourly.toFixed(6),\n    monthly_usd: +(hourly * 730).toFixed(2),\n    source: 'Azure Retail Prices API',\n  }});\n}\nreturn out;"
+      },
+      "id": "ca544d64-ec55-46b2-8c5f-58d1caf4c052",
+      "name": "Azure 정규화",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// GCP Cloud Billing Catalog (Compute Engine SKU) → 공통 스키마\n// 머신 가격 = vCPU 단가 × vCPU 수 + 메모리(GiB) 단가 × GiB 수\nconst REGION = 'asia-northeast3'; // 서울\nconst MACHINES = [\n  { fam: 'N2', instance: 'n2-standard-4', family: 'N2 (Intel)',       vcpu: 4, mem: 16 },\n  { fam: 'E2', instance: 'e2-standard-4', family: 'E2 (Cost-optimized)', vcpu: 4, mem: 16 },\n];\nconst skus = $input.all().flatMap(i => i.json.skus || []);\nif (!skus.length) return []; // 조회 실패 시 빈 결과\n\nconst unitPrice = s => {\n  const tiers = s?.pricingInfo?.[0]?.pricingExpression?.tieredRates || [];\n  const t = tiers[tiers.length - 1];\n  if (!t) return null;\n  return Number(t.unitPrice.units || 0) + (t.unitPrice.nanos || 0) / 1e9;\n};\nconst findSku = (fam, kind, usageType) => skus.find(s =>\n  s.category?.usageType === usageType &&\n  (s.serviceRegions || []).includes(REGION) &&\n  new RegExp(`(^|\\\\s)${fam} Instance ${kind} running in`, 'i').test(s.description || '') &&\n  !/custom|sole tenancy|extended|commit/i.test(s.description || '')\n);\n\nconst today = $now.setZone('Asia/Seoul').toFormat('yyyy-MM-dd');\nconst out = [];\nfor (const m of MACHINES) {\n  for (const [usageType, pricing] of [['OnDemand', 'OnDemand'], ['Preemptible', 'Spot']]) {\n    const core = findSku(m.fam, 'Core', usageType);\n    const ram  = findSku(m.fam, 'Ram',  usageType);\n    if (!core || !ram) continue;\n    const hourly = m.vcpu * unitPrice(core) + m.mem * unitPrice(ram);\n    out.push({ json: {\n      date: today,\n      provider: 'GCP',\n      instance: m.instance,\n      family: m.family,\n      vcpu: m.vcpu,\n      memory_gb: m.mem,\n      region: 'asia-northeast3 (Seoul)',\n      pricing,\n      hourly_usd: +hourly.toFixed(6),\n      monthly_usd: +(hourly * 730).toFixed(2),\n      source: 'GCP Cloud Billing Catalog API',\n    }});\n  }\n}\nreturn out;"
+      },
+      "id": "0d250e15-af87-4ed3-b239-2029301819e7",
+      "name": "GCP 정규화",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        240
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "9dd35df4-d003-4b61-a366-e27b2a5a8a4b",
+      "name": "가격 합치기",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        480,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit?gid=168202732#gid=168202732",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 168202732,
+          "mode": "list",
+          "cachedResultName": "prices",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit#gid=168202732"
+        },
+        "options": {}
+      },
+      "id": "c088f219-b045-48a9-9d58-f1465e0591df",
+      "name": "기존 가격 읽기",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        704,
+        128
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "XwfiWbkFSDPRbakW",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// 전일 대비 변동 계산 + 최저가 표시\nconst now = $now.setZone('Asia/Seoul');\nconst current = $('가격 합치기').all().map(i => i.json).filter(r => r.provider);\nconst history = $input.all().map(i => i.json).filter(r => r.price_key);\nconst seriesOf = r => `${r.provider}|${r.instance}|${r.pricing}`;\n\nconst out = current.map(r => {\n  const series = seriesOf(r);\n  const prev = history\n    .filter(h => seriesOf(h) === series && String(h.date) < r.date)\n    .sort((a, b) => String(b.date).localeCompare(String(a.date)))[0];\n  const prevHourly = prev ? Number(prev.hourly_usd) : null;\n  const changed = prevHourly !== null && Math.abs(r.hourly_usd - prevHourly) > 1e-9;\n  return { json: {\n    price_key: `${r.date}|${series}`,\n    ...r,\n    prev_hourly_usd: prevHourly ?? '',\n    change_pct: prevHourly ? +(((r.hourly_usd - prevHourly) / prevHourly) * 100).toFixed(3) : '',\n    cheapest: false,\n    changed,\n    collected_at: now.toISO(),\n  }};\n});\n\n// 같은 과금 방식(OnDemand / Spot) 안에서 가장 싼 것 표시\nfor (const p of ['OnDemand', 'Spot']) {\n  const group = out.filter(o => o.json.pricing === p);\n  if (!group.length) continue;\n  const min = Math.min(...group.map(o => o.json.hourly_usd));\n  group.forEach(o => { o.json.cheapest = o.json.hourly_usd === min; });\n}\nreturn out;"
+      },
+      "id": "1d98f3bf-6267-4ea8-ac6b-79ab4db79455",
+      "name": "변동 계산",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit?gid=168202732#gid=168202732",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 168202732,
+          "mode": "list",
+          "cachedResultName": "prices",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1qOA70tkrKcPBOu43AIqpfuD3UlI0u3zRDqcZ4RdeydE/edit#gid=168202732"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "price_key"
+          ],
+          "schema": [
+            {
+              "id": "price_key",
+              "displayName": "price_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "date",
+              "displayName": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "provider",
+              "displayName": "provider",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "instance",
+              "displayName": "instance",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "family",
+              "displayName": "family",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vcpu",
+              "displayName": "vcpu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "memory_gb",
+              "displayName": "memory_gb",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "region",
+              "displayName": "region",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pricing",
+              "displayName": "pricing",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "hourly_usd",
+              "displayName": "hourly_usd",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "monthly_usd",
+              "displayName": "monthly_usd",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "prev_hourly_usd",
+              "displayName": "prev_hourly_usd",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "change_pct",
+              "displayName": "change_pct",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "cheapest",
+              "displayName": "cheapest",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "changed",
+              "displayName": "changed",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "collected_at",
+              "displayName": "collected_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "86480708-c67f-443e-9341-578e3eb6766d",
+      "name": "가격 저장(업서트)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1168,
+        32
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "XwfiWbkFSDPRbakW",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "d2000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.changed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f3402869-2418-49d6-9b2f-156c78f47aa7",
+      "name": "가격 변동만",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "8892721968",
+        "text": "=💰 요금 변동 감지 [{{ $json.provider }}] {{ $json.instance }} ({{ $json.pricing }})\n지역: {{ $json.region }}\n시간당: ${{ $json.prev_hourly_usd }} → ${{ $json.hourly_usd }} ({{ $json.change_pct }}%)\n월 환산: ${{ $json.monthly_usd }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "14957b4b-41c4-4be0-bcbd-7886e339785f",
+      "name": "텔레그램 알림",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1392,
+        240
+      ],
+      "webhookId": "fb935d2d-4af7-4a0c-9aaa-990a2411b59c",
+      "credentials": {
+        "telegramApi": {
+          "id": "CWcoAfDMB9krqyUU",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "매일 오전 9시": {
+      "main": [
+        [
+          {
+            "node": "Azure 요금 조회",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "GCP 요금 조회",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Azure 요금 조회": {
+      "main": [
+        [
+          {
+            "node": "Azure 정규화",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCP 요금 조회": {
+      "main": [
+        [
+          {
+            "node": "GCP 정규화",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Azure 정규화": {
+      "main": [
+        [
+          {
+            "node": "가격 합치기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCP 정규화": {
+      "main": [
+        [
+          {
+            "node": "가격 합치기",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "가격 합치기": {
+      "main": [
+        [
+          {
+            "node": "기존 가격 읽기",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "기존 가격 읽기": {
+      "main": [
+        [
+          {
+            "node": "변동 계산",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "변동 계산": {
+      "main": [
+        [
+          {
+            "node": "가격 저장(업서트)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "가격 변동만",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "가격 변동만": {
+      "main": [
+        [
+          {
+            "node": "텔레그램 알림",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "bXk8kyYMo7jHgZTf",
+    "timezone": "Asia/Seoul",
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": -1,
+    "availableInMCP": false,
+    "timeSavedPerExecution": 10
+  },
+  "versionId": "bf3b7244-2884-491f-b895-caf53eac6e46",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "34462e24046148020c6f8e4e8e9b1d03aa7907210ded0dfc77e75c690cc27ee1"
+  },
+  "nodeGroups": [],
+  "id": "KDy175Nw0gvBYu2r",
+  "tags": []
+}
